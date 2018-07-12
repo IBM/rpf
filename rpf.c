@@ -23,16 +23,14 @@ enum link_state
 {
    LINK_STATE_UNINIT,
    LINK_STATE_INIT,
-   LINK_STATE_ADDR_RESOLVED, /* client */
-   LINK_STATE_ROUTE_RESOLVED, /* client */
+   LINK_STATE_ADDR_RESOLVED,
+   LINK_STATE_ROUTE_RESOLVED,
    LINK_STATE_READY,
-	LINK_STATE_CONNECTING, /* server: client has sent request */
    LINK_STATE_CONNECTED,
 };
 
 typedef struct rpf_link
 {
-   struct list_head list;				/* for storing in a linked list */
    enum link_state state;
    unsigned int rkey;               /* RDMA remote key */
    struct completion cm_done;       /* connection manager wait object */
@@ -57,11 +55,6 @@ struct ib_device_list {
    spinlock_t lock;
 };
 
-struct rpf_link_list {
-   struct list_head list;
-   spinlock_t lock;
-};
-
 typedef struct rpf_object
 {
    struct kobject* sysfsroot;
@@ -75,29 +68,26 @@ typedef struct rpf_object
 
 /**** RDMA ****/
 
-/* used to send memory region details from server to client */
+/* used to receive memory region details from the server */
 struct mr_context {
 	void		       *addr;
 	uint32_t		rkey;
 };
 
 // some forward declarations to keep things organized
-// sysfs functions must be added to Documentation/ABI
+// must be added to Documentation/ABI
 ssize_t show_readme(struct kobject *kobj, struct kobj_attribute *attr, char *buff);
 ssize_t show_pid(struct kobject *kobj, struct kobj_attribute *attr, char *buff);
 ssize_t store_pid(struct kobject *kobj, struct kobj_attribute *attr, const char *buff, size_t size);
-ssize_t store_pid_srv(struct kobject *kobj, struct kobj_attribute *attr, const char *buff, size_t size);
 ssize_t show_server(struct kobject *kobj, struct kobj_attribute *attr, char *buff);
 ssize_t store_server(struct kobject *kobj, struct kobj_attribute *attr, const char *buff, size_t size);
 ssize_t show_port(struct kobject *kobj, struct kobj_attribute *attr, char *buff);
 ssize_t store_port(struct kobject *kobj, struct kobj_attribute *attr, const char *buff, size_t size);
 void on_device_add(struct ib_device *dev);
 void on_device_remove(struct ib_device *dev, void *client_data);
-static int on_client_connect(struct rdma_cm_id *listener, struct rdma_cm_event *event);
 
 // the one and only global object
 static rpf_object rpf;
-static struct rdma_cm_id listen_id; // the other global object
 
 static struct ib_client rpf_ib_client = {
 	.name	= "RPF_IBClient",
@@ -110,11 +100,6 @@ struct ib_device_list ib_device_list = {
 	.list = LIST_HEAD_INIT(ib_device_list.list),
 };
 
-struct rpf_link_list rpf_link_list = {
-	.lock = __SPIN_LOCK_UNLOCKED(rpf_link_link.lock),
-	.list = LIST_HEAD_INIT(rpf_link_list.list),
-};
-
 static const char help_text[] = 
 "Use the server file to set the IP address or host name of the remote server that will be serving the page faults\n"
 "Use the port file to set the port number of the listening RDMA connection on the server\n"
@@ -123,14 +108,12 @@ static const char help_text[] =
 /* some sysfs stuff */
 struct kobj_attribute readme_attr = __ATTR(readme, 0444, show_readme, NULL);
 struct kobj_attribute pid_attr = __ATTR(pid, 0644, show_pid, store_pid);
-struct kobj_attribute pid_srv_attr = __ATTR(pid_srv, 0644, NULL, store_pid_srv);
 struct kobj_attribute server_attr = __ATTR(rhost, 0644, show_server, store_server);
 struct kobj_attribute port_attr = __ATTR(rport, 0644, show_port, store_port);
 
 struct attribute *rpf_attributes[] = {
    &readme_attr.attr,
    &pid_attr.attr,
-   &pid_srv_attr.attr,
    &server_attr.attr,
    &port_attr.attr,
    NULL
@@ -220,17 +203,6 @@ int cm_event_handler(struct rdma_cm_id *cm_id,
    rpf_link *link = cm_id->context;
 
 	switch (event->event) {
-	case RDMA_CM_EVENT_CONNECT_REQUEST:
-      printk("RPF: client connected\n");
-		on_client_connect(cm_id, event);
-		break;
-
-	case RDMA_CM_EVENT_CONNECT_RESPONSE:
-		break;
-
-	case RDMA_CM_EVENT_CONNECT_ERROR:
-		break;
-
 	case RDMA_CM_EVENT_ADDR_ERROR:
       printk("RPF: address resolution error\n");
       break;
@@ -244,7 +216,7 @@ int cm_event_handler(struct rdma_cm_id *cm_id,
 		break;
 
 	case RDMA_CM_EVENT_ESTABLISHED:
-      printk("RPF: connected\n");
+      link->state = LINK_STATE_CONNECTED;
 		break;
 
 	case RDMA_CM_EVENT_REJECTED:
@@ -253,7 +225,6 @@ int cm_event_handler(struct rdma_cm_id *cm_id,
 
 	case RDMA_CM_EVENT_DISCONNECTED:
       printk("RPF: discconnected\n");
-      link->state = LINK_STATE_INIT;
       break;
 
    default:
@@ -292,30 +263,13 @@ int rpf_setup_link(struct rpf_link *link)
 	struct ib_qp_init_attr qp_attr;
    int ret;
 
-	if (!link) {
-		printk("Bad link\n");
-		return -1;
-	}
-
-	if (!link->cm_id) {
-		printk("Bad cm\n");
-		return -1;
-	}
-
-	if (!link->cm_id->device) {
-		printk("Bad device\n");
-		return -1;
-	}
-
    printk("RPF: setup_link\n");
-   if (link->state != LINK_STATE_ROUTE_RESOLVED
-		&& link->state != LINK_STATE_CONNECTING) {
-      printk("Link route not resolved (%i)\n", link->state);
+   if (link->state != LINK_STATE_ROUTE_RESOLVED) {
+      printk("Link route not resolved\n");
       return -1;
    }
 
    /* allocate Protection Domain */
-	printk("PD\n");
    link->pd = ib_alloc_pd(link->cm_id->device, 0);
 	if (IS_ERR(link->pd)) {
 		ret = PTR_ERR(link->pd);
@@ -324,7 +278,6 @@ int rpf_setup_link(struct rpf_link *link)
 	}
 
    /* create completion queue */
-	printk("CQ\n");
    link->cq = ib_alloc_cq(link->cm_id->device, link, 3, 0, IB_POLL_SOFTIRQ);
 	if (IS_ERR(link->cq)) {
 		ret = PTR_ERR(link->cq);
@@ -333,7 +286,6 @@ int rpf_setup_link(struct rpf_link *link)
 	}
 
    /* create the queue pair */
-	printk("QP\n");
 	memset(&qp_attr, 0, sizeof(qp_attr));
 	qp_attr.cap.max_send_wr = 2;
 	qp_attr.cap.max_recv_wr = 2;
@@ -476,109 +428,6 @@ err_resolve:
    return -1;
 }
 
-#define SERVER_LISTEN_BACKLOG 1
-
-static int server_run(struct rdma_cm_id *cm_id, unsigned int pid)
-{
-	int ret;
-	//struct rdma_conn_param conn_param;
-   struct sockaddr_in srv;
-
-	printk("running server for pid %i\n", pid);
-
-	/* Create the RDMA CM ID  */
-   printk("rdma_create_id\n");
-	cm_id = rdma_create_id(&init_net, cm_event_handler, NULL,
-				     RDMA_PS_TCP, IB_QPT_RC);
-	if (IS_ERR(cm_id)) {
-      printk("RPF: error creating cm_id\n");
-		ret = -2;
-		goto err_id;
-   }
-
-	// bind
-	memset(&srv, 0, sizeof(struct sockaddr));
-	srv.sin_family = AF_INET;
-	srv.sin_addr.s_addr = (__force u32)htonl(INADDR_ANY);
-	//in4_pton("10.64.100.2", -1, (u8*)&srv.sin_addr.s_addr, -1, NULL);
-	srv.sin_port = (__force u16)htons(7471);
-
-	ret = rdma_bind_addr(cm_id, (struct sockaddr*)&srv);
-	if (ret) {
-		printk("RPF: error %i binding\n", ret);
-		ret = -3;
-		goto err_listen;
-	}
-
-	// listen
-	printk("rdma_listen\n");
-	ret = rdma_listen(cm_id, SERVER_LISTEN_BACKLOG);
-	if (ret) {
-		printk("RPF: error %i listening\n", ret);
-		ret = -4;
-		goto err_listen;
-	}
-	return 0;
-
-err_listen:
-	// destroy ep
-   rdma_destroy_id(cm_id);
-   cm_id = NULL;
-
-err_id:
-	return ret;
-}
-
-static int on_client_connect(struct rdma_cm_id *listener, struct rdma_cm_event *event)
-{
-	int ret;
-	rpf_link *link;
-	struct rdma_conn_param conn_param;
-
-	link = kzalloc(sizeof(struct rpf_link), GFP_KERNEL);
-	if (!link) {
-      printk("rpf: unable to allocate memory on_device_add\n");
-		return -1;
-   }
-	init_completion(&link->cm_done);
-	init_completion(&link->cq_done);
-
-	// get request
-	link->cm_id = listener;
-	link->state = LINK_STATE_CONNECTING;
-
-	// create qp
-	printk("Setting up link\n");
-	rpf_setup_link(link);
-
-	// register mr
-	// accept
-	printk("Accepting\n");
-	memset(&conn_param, 0, sizeof(struct rdma_conn_param));
-	conn_param.responder_resources = 2;
-	conn_param.initiator_depth = 2;
-	conn_param.retry_count = 1;
-	conn_param.rnr_retry_count = 7;
-	ret = rdma_accept(link->cm_id, &conn_param);
-	if (ret) {
-		printk("RPF: error %i accepting\n", ret);
-		return -1;
-	}
-
-	link->state = LINK_STATE_CONNECTED;
-	printk("Connection accepted!\n");
-
-	// send mr info
-	//ret = ib_post_send(struct ib_qp *qp,
-	//		       struct ib_send_wr *send_wr,
-	//		       struct ib_send_wr **bad_send_wr);
-
-	// wait for send completion
-	// wait for disconnect
-
-	return 0;
-}
-
 static int unregister_pid(struct rpf_link *link)
 {
 	struct userfaultfd_wake_range range;
@@ -617,10 +466,7 @@ void rpf_cleanup_link(struct rpf_link *link)
    }
 
    if (link->cm_id) {
-		if (link->cm_id->qp) {
-      	rdma_destroy_qp(link->cm_id);
-			link->cm_id->qp = NULL;
-		}
+      rdma_destroy_qp(link->cm_id);
       rdma_destroy_id(link->cm_id);
       link->cm_id = NULL;
    }
@@ -909,14 +755,6 @@ ssize_t store_pid(struct kobject *kobj, struct kobj_attribute *attr, const char 
 		return size;
    }
 
-	init_completion(&link->cm_done);
-	init_completion(&link->cq_done);
-
-   /* add it to our list of links */
-	spin_lock(&rpf_link_list.lock);
-	list_add_tail(&link->list, &rpf_link_list.list);
-	spin_unlock(&rpf_link_list.lock);
-
    // when a pid is added, its memory should be registered immediately with userfaultfd
    link->uf_ctx = register_pid(pid, link);
    if (!link->uf_ctx) {
@@ -924,34 +762,15 @@ ssize_t store_pid(struct kobject *kobj, struct kobj_attribute *attr, const char 
       return size;
    }
 
+	init_completion(&link->cm_done);
+	init_completion(&link->cq_done);
+
    // now set up RDMA
    rpf_run(link, rpf.rhost_ip, rpf.rhost_port);
 
    rpf.active_pid = pid;
 
    return size;
-}
-
-ssize_t store_pid_srv(struct kobject *kobj, struct kobj_attribute *attr, const char *buff, size_t size)
-{
-	int ret=0;
-	unsigned int pid;
-
-	if (sscanf(buff, "%u", &pid) != 1)
-		return 0;
-
-   if (!pid)
-      return size;
-
-	// set up the server-side connection
-	ret = server_run(&listen_id, pid);
-	if (ret == 0) {
-		printk("Waiting for client\n");
-	} else {
-		printk("RPF: something bad %i happened on server side\n", ret);
-	}
-
-	return size;
 }
 
 ssize_t show_server(struct kobject *kobj, struct kobj_attribute *attr, char *buff)
@@ -1002,20 +821,11 @@ static int __init rpf_init_module(void)
 
 static void __exit rpf_cleanup_module(void)
 {
-	struct rpf_link *link, *temp;
-
    printk("RPF: exit\n");
 
 	ib_unregister_client(&rpf_ib_client);
 
-   /* destroy all remaining links (server & client) */
-	spin_lock(&rpf_link_list.lock);
-	list_for_each_entry_safe(link, temp, &rpf_link_list.list, list) {
-   	rpf_cleanup_link(link);
-		list_del(&link->list);
-		kfree(link);
-	}
-	spin_unlock(&rpf_link_list.lock);
+   rpf_cleanup_link(&rpf.link);
 
 	cleanup_sysfs();
 }
