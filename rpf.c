@@ -3,6 +3,11 @@
 #include <linux/kthread.h>
 #include <linux/inet.h>
 #include <rdma/rdma_cm.h>
+#include <rdma/ib_verbs.h>
+#include <rdma/ib_umem_odp.h>
+#include <rdma/uverbs_types.h>
+#include <rdma/uverbs_std_types.h>
+#include <rdma/ib_umem.h>
 
 /* use this for timing measurements on PPC64 */
 #define MFSPR(_x) __asm__ volatile ("mfspr %0, 268" : "=r" (_x))
@@ -18,6 +23,11 @@ There is an RDMA queue pair per address space (pid). Each queue pair is associat
 #define RDMA_RESOLVE_TIMEOUT 2000
 #define RDMA_XCHNG_BUF_SIZE 16
 #define RDMA_MAX_OUTSTANDING_READS 1
+
+struct mlx5_ib_pd {
+	struct ib_pd		ibpd;
+	u32			pdn;
+};
 
 enum link_state
 {
@@ -44,6 +54,7 @@ typedef struct rpf_link
    void* page_in;                   /* page sized buffer described by mr_page */
    dma_addr_t recv_msg_dma;         /* memory region to hold incoming page */
    char* recv_msg;
+	struct ib_ucontext *ucontext;
 } rpf_link;
 
 struct ib_device_entry {
@@ -81,6 +92,42 @@ struct mr_context {
 	uint32_t		rkey;
 };
 
+// copied (and slightly modified) from uverbs.h since it is an internal header
+static int _copy_from_udata(void *dest, struct ib_udata *udata, size_t len)
+{
+	return memcpy(dest, udata->inbuf, len) ? -EFAULT : 0;
+}
+
+static int _copy_to_udata(struct ib_udata *udata, void *src, size_t len)
+{
+	return memcpy(udata->outbuf, src, len) ? -EFAULT : 0;
+}
+
+static struct ib_udata_ops rpf_verbs_copy = {
+	.copy_from = _copy_from_udata,
+	.copy_to   = _copy_to_udata
+};
+
+static inline void
+ib_uverbs_init_udata(struct ib_udata *udata,
+		     const void *ibuf,
+		     void *obuf,
+		     size_t ilen, size_t olen)
+{
+	udata->ops    = &rpf_verbs_copy;
+	udata->inbuf  = ibuf;
+	udata->outbuf = obuf;
+	udata->inlen  = ilen;
+	udata->outlen = olen;
+	udata->src = IB_UDATA_LEGACY_CMD;
+}
+
+struct IB_USER_VERBS_CMD_REG_MR_core {
+		 		 struct ib_uverbs_cmd_hdr hdr;
+		 		 struct ib_uverbs_reg_mr req;
+		 		 struct ib_uverbs_reg_mr_resp resp;
+};
+
 // some forward declarations to keep things organized
 // sysfs functions must be added to Documentation/ABI
 ssize_t show_readme(struct kobject *kobj, struct kobj_attribute *attr, char *buff);
@@ -98,6 +145,7 @@ static int on_client_connect(struct rdma_cm_id *listener, struct rdma_cm_event *
 // the one and only global object
 static rpf_object rpf;
 static struct rdma_cm_id listen_id; // the other global object
+uint8_t send_msg[16]; // this global object should go away
 
 static struct ib_client rpf_ib_client = {
 	.name	= "RPF_IBClient",
@@ -287,9 +335,39 @@ rdma_post_recv(rpf_link *link,
    return ib_post_recv(link->cm_id->qp, &wr, &bad_wr);
 }
 
+static inline int
+rdma_post_send(rpf_link *link,
+         void (*compl_fn)(struct ib_cq *cq, struct ib_wc *wc),
+         u64 remote_addr, dma_addr_t dest, size_t length, struct ib_pd *pd)
+{
+   struct ib_rdma_wr rdma_wr;
+   struct ib_send_wr *bad_swr;
+	struct ib_sge sge;
+	struct ib_cqe *cqe; /* completion queue entry */
+
+	sge.addr = (uint64_t) dest;
+	sge.length = (uint32_t) length;
+	sge.lkey = pd->local_dma_lkey;
+
+	cqe = kzalloc(sizeof(struct ib_cqe), GFP_KERNEL);
+	cqe->done = compl_fn;
+
+	rdma_wr.wr.next = NULL;
+	rdma_wr.wr.wr_cqe = cqe;
+	rdma_wr.wr.sg_list = &sge;
+	rdma_wr.wr.num_sge = 1;
+	rdma_wr.wr.opcode = IB_WR_RDMA_READ;
+   rdma_wr.wr.send_flags = IB_SEND_SIGNALED;
+   rdma_wr.remote_addr = remote_addr;
+   rdma_wr.rkey = link->rkey;
+   return ib_post_send(link->cm_id->qp, &rdma_wr.wr, &bad_swr);
+}
+
 int rpf_setup_link(struct rpf_link *link)
 {
 	struct ib_qp_init_attr qp_attr;
+	struct ib_uobject *uobj;
+	struct ib_udata                   udata;
    int ret;
 
 	if (!link) {
@@ -314,14 +392,45 @@ int rpf_setup_link(struct rpf_link *link)
       return -1;
    }
 
+	/* ucontext 
+	printk("init_ucontext\n");
+	ib_uverbs_init_udata(&udata, 0, 0, 0, 0);
+	link->ucontext = link->cm_id->device->alloc_ucontext(link->cm_id->device, &udata);
+	if (IS_ERR(link->ucontext)) {
+		ret = PTR_ERR(link->ucontext);
+		printk("RPF: Can't alloc ucontext %i\n", ret);
+		return -3;
+	}
+	link->ucontext->device = link->cm_id->device;
+	link->ucontext->tgid = link->cm_id->context;
+	uverbs_initialize_ucontext(link->ucontext);
+	link->ucontext->umem_tree = RB_ROOT;
+	init_rwsem(&link->ucontext->umem_rwsem);
+	link->ucontext->odp_mrs_count = 0;
+	INIT_LIST_HEAD(&link->ucontext->no_private_counters);
+	link->ucontext->invalidate_range = NULL;
+*/
+
    /* allocate Protection Domain */
+	printk("uobj\n");
+	uobj  = uobj_alloc(uobj_get_type(pd), link->ucontext);
+	if (IS_ERR(uobj)) {
+		printk("error in uobj\n");
+		return PTR_ERR(uobj);
+	}
+
 	printk("PD\n");
+	//pd = ib_dev->alloc_pd(ib_dev, file->ucontext, &udata);
    link->pd = ib_alloc_pd(link->cm_id->device, 0);
 	if (IS_ERR(link->pd)) {
 		ret = PTR_ERR(link->pd);
 		printk("RPF: ib_alloc_pd failed %i\n", ret);
       goto err_pd;
 	}
+	link->pd->device  = link->cm_id->device;
+	link->pd->uobject = uobj;
+	uobj->object = link->pd;
+	uobj_alloc_commit(uobj);
 
    /* create completion queue */
 	printk("CQ\n");
@@ -432,7 +541,7 @@ static int rpf_run(struct rpf_link *link, unsigned int srv_ip, unsigned short sr
 		goto err_reg_xchng;
 	}
 
-   /* get memory region details from server */
+   /* to receive memory region details from server later */
 	ret = rdma_post_recv(link, cq_comp_handler, (void*)link->recv_msg_dma,
       RDMA_XCHNG_BUF_SIZE, link->pd);
 	if (ret) {
@@ -484,6 +593,9 @@ static int server_run(struct rdma_cm_id *cm_id, unsigned int pid)
 	//struct rdma_conn_param conn_param;
    struct sockaddr_in srv;
 
+	// make sure there isn't already a server running for this pid
+
+	// start a new server
 	printk("running server for pid %i\n", pid);
 
 	/* Create the RDMA CM ID  */
@@ -495,6 +607,9 @@ static int server_run(struct rdma_cm_id *cm_id, unsigned int pid)
 		ret = -2;
 		goto err_id;
    }
+
+	// yeah, stuff it in there - it'll fit
+	cm_id->context = (void*)(u64)pid;
 
 	// bind
 	memset(&srv, 0, sizeof(struct sockaddr));
@@ -534,6 +649,19 @@ static int on_client_connect(struct rdma_cm_id *listener, struct rdma_cm_event *
 	int ret;
 	rpf_link *link;
 	struct rdma_conn_param conn_param;
+	struct mr_context *mr_ctx;
+	//unsigned int pid;
+   //struct mm_struct *mm;
+   //struct task_struct *task;
+	//struct ib_umem *umem;
+	//int num_pages;
+	//struct ib_uverbs_get_context      cmd;
+	//struct ib_uverbs_get_context_resp resp;
+	//char ubuf[64]; // not sure what to put here
+	//struct mlx5_ib_alloc_ucontext_req_v2 req = {};
+	//struct IB_USER_VERBS_CMD_REG_MR_core reg_cmd;
+	struct ib_mr_init_attr	     attr = {0};
+	struct ib_mr                *mr;
 
 	link = kzalloc(sizeof(struct rpf_link), GFP_KERNEL);
 	if (!link) {
@@ -547,11 +675,75 @@ static int on_client_connect(struct rdma_cm_id *listener, struct rdma_cm_event *
 	link->cm_id = listener;
 	link->state = LINK_STATE_CONNECTING;
 
+
 	// create qp
 	printk("Setting up link\n");
 	rpf_setup_link(link);
 
-	// register mr
+	// register mr after recovering the pid
+/*
+ibv_exp_reg_mr()
+write(5, "K\0\0\0\7\0\3\0`\353\377\377\377\177\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 80) = 80
+ | 00000  4b 00 00 00 07 00 03 00  60 eb ff ff ff 7f 00 00  K.......`....... |
+ | 00010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................ |
+ | 00020  ff ff ff ff ff ff ff ff  00 00 00 00 00 00 00 00  ................ |
+ | 00030  00 00 00 00 00 00 00 00  05 00 00 00 00 40 00 00  .............@.. |
+ | 00040  00 00 00 00 00 00 00 00  50 54 ff b7 ff 7f 00 00  ........PT...... |
+
+64 pd
+64 addr=0
+64 len
+64 access
+32 mask
+32 flags
+64 dm
+*/
+
+	// follow the example of ib_uverbs_get_context() from core/uverbs_cmd.c
+	printk("pd: %p\n", link->pd);
+	printk("uobject: %p\n", ((struct mlx5_ib_pd*)link->pd)->ibpd.uobject);
+	printk("context: %p\n", ((struct mlx5_ib_pd*)link->pd)->ibpd.uobject->context);
+
+	printk("reg_user_mr\n");
+
+	attr.start = 0;//cmd.start;
+	attr.length = ~((size_t)0); //cmd.length;
+	attr.hca_va = 0;//cmd.hca_va;
+	attr.access_flags = IB_ACCESS_LOCAL_WRITE | IB_ACCESS_REMOTE_READ | IB_ACCESS_ON_DEMAND;
+	attr.dm = 0;//dm;
+
+	mr = link->cm_id->device->reg_user_mr(link->pd, &attr, NULL);
+	if (IS_ERR(mr)) {
+		ret = PTR_ERR(mr);
+		return -5;
+	}
+
+	mr->device  = link->cm_id->device;
+	mr->pd      = link->pd;
+	atomic_inc(&link->pd->usecnt);
+
+	printk("Rkey: 0x%x\n", mr->rkey);
+
+/*
+	printk("ib_alloc_odp_umem\n");
+	umem = ib_alloc_odp_umem(ucontext, 0, -1);
+	if (IS_ERR(umem)) {
+		ret = PTR_ERR(umem);
+		printk("RPF: Can't alloc umem %i\n", ret);
+		return -4;
+	}
+	//struct ib_ucontext *context = umem->context;
+	ret = ib_umem_odp_map_dma_pages(umem, 0, -1, IB_ACCESS_REMOTE_READ | IB_ACCESS_LOCAL_WRITE,
+		1, 0, &num_pages);
+	if (!ret) {
+		printk("RPF: can't map odp %i\n", ret);
+		goto err_odp;
+	}
+
+	// clean up
+	//ib_umem_odp_release(umem);
+*/
+
 	// accept
 	printk("Accepting\n");
 	memset(&conn_param, 0, sizeof(struct rdma_conn_param));
@@ -569,14 +761,19 @@ static int on_client_connect(struct rdma_cm_id *listener, struct rdma_cm_event *
 	printk("Connection accepted!\n");
 
 	// send mr info
-	//ret = ib_post_send(struct ib_qp *qp,
-	//		       struct ib_send_wr *send_wr,
-	//		       struct ib_send_wr **bad_send_wr);
+	mr_ctx = (struct mr_context*)send_msg;
+	mr_ctx->addr = (void*)0x12340000;//big_mr->addr;
+	mr_ctx->rkey = mr->rkey;
+	ret = rdma_post_send(link, cq_comp_handler, (u64)send_msg, 0, sizeof(struct mr_context), link->pd);
 
 	// wait for send completion
 	// wait for disconnect
 
 	return 0;
+
+//err_odp:
+//	ib_umem_odp_release(umem);
+	return -1;
 }
 
 static int unregister_pid(struct rpf_link *link)
